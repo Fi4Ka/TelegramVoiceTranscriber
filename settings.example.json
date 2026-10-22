@@ -1,0 +1,8 @@
+{
+  "BotToken": "PASTE_YOUR_BOT_TOKEN",
+  "WhisperExe": "tools/whisper/Release/whisper-cli.exe",
+  "WhisperModel": "tools/models/ggml-base.bin",
+  "FfmpegExe": "ffmpeg",
+  "Language": "auto",
+  "MaxVoiceSeconds": 180
+}
