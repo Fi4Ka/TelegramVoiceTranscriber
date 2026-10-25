@@ -1,6 +1,7 @@
-using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Runtime.InteropServices;
+using TelegramVoiceTranscriber;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
@@ -15,6 +16,7 @@ var configFile = Path.Combine(root, "settings.local.json");
 if (!File.Exists(configFile))
 {
     Console.Error.WriteLine("Нет settings.local.json. Скопируйте settings.example.json и укажите токен.");
+    Environment.ExitCode = 1;
     return;
 }
 
@@ -23,17 +25,28 @@ var config = JsonSerializer.Deserialize<BotSettings>(
     new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
     ?? throw new InvalidOperationException("Не удалось прочитать настройки.");
 
-if (string.IsNullOrWhiteSpace(config.BotToken) || config.BotToken == "PASTE_YOUR_BOT_TOKEN")
-    throw new InvalidOperationException("Укажите BotToken в settings.local.json.");
+// Keep secrets out of the JSON file when the runtime can inject environment variables.
+string botToken = Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN") ?? config.BotToken;
+if (config.MaxVoiceSeconds <= 0 || config.MaxQueuedTranscriptions <= 0)
+    throw new InvalidOperationException("MaxVoiceSeconds и MaxQueuedTranscriptions должны быть положительными.");
 
-string whisperExe = ResolvePath(config.WhisperExe);
-string whisperModel = ResolvePath(config.WhisperModel);
-string ffmpegExe = ResolvePath(config.FfmpegExe);
+string whisperExe = RuntimePaths.ResolveExecutable(config.WhisperExe, root);
+string whisperModel = Path.GetFullPath(config.WhisperModel, root);
+string ffmpegExe = RuntimePaths.ResolveExecutable(config.FfmpegExe, root);
 
-if (!File.Exists(whisperExe))
-    throw new FileNotFoundException("Не найден whisper-cli.exe. Запустите setup-windows.ps1.", whisperExe);
 if (!File.Exists(whisperModel))
-    throw new FileNotFoundException("Не найдена модель Whisper. Запустите setup-windows.ps1.", whisperModel);
+    throw new FileNotFoundException("Не найдена модель Whisper. Проверьте WhisperModel.", whisperModel);
+
+if (args.Contains("--check", StringComparer.OrdinalIgnoreCase))
+{
+    await ProcessRunner.RunAsync(ffmpegExe, ["-version"], root, CancellationToken.None);
+    await ProcessRunner.RunAsync(whisperExe, ["--help"], root, CancellationToken.None);
+    Console.WriteLine("OK: настройки, FFmpeg и Whisper доступны; файл модели найден. Telegram не подключался.");
+    return;
+}
+
+if (string.IsNullOrWhiteSpace(botToken) || botToken == "PASTE_YOUR_BOT_TOKEN")
+    throw new InvalidOperationException("Укажите TELEGRAM_BOT_TOKEN или BotToken в settings.local.json.");
 
 var dataDir = Path.Combine(root, "data");
 Directory.CreateDirectory(dataDir);
@@ -44,19 +57,27 @@ Dictionary<string, VoiceJob> pending = File.Exists(pendingFile)
     : new();
 
 using var cts = new CancellationTokenSource();
-using var whisperGate = new SemaphoreSlim(1, 1);
+var queue = new TranscriptionQueue(config.MaxQueuedTranscriptions);
+var handlers = new HandlerTracker();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+using var termination = OperatingSystem.IsWindows() ? null : PosixSignalRegistration.Create(
+    PosixSignal.SIGTERM, context => { context.Cancel = true; cts.Cancel(); });
 
-var bot = new TelegramBotClient(config.BotToken, cancellationToken: cts.Token);
+var bot = new TelegramBotClient(botToken, cancellationToken: cts.Token);
 var identity = await bot.GetMe();
 
-bot.OnMessage += OnMessage;
-bot.OnUpdate += OnUpdate; // callback button presses arrive here, not in OnMessage.
+bot.OnMessage += (message, type) => handlers.RunAsync(() => OnMessage(message, type));
+bot.OnUpdate += update => handlers.RunAsync(() => OnUpdate(update));
 Console.WriteLine($"Бот @{identity.Username} запущен. Ctrl+C — остановить.");
 Console.WriteLine("После голосового появится кнопка «Показать транскрипцию».");
 
 try { await Task.Delay(Timeout.Infinite, cts.Token); }
 catch (OperationCanceledException) { /* normal shutdown */ }
+finally
+{
+    cts.Cancel();
+    await handlers.StopAsync();
+}
 
 async Task OnMessage(Message message, UpdateType updateType)
 {
@@ -117,6 +138,13 @@ async Task OnMessage(Message message, UpdateType updateType)
 
 async Task OnUpdate(Update update)
 {
+    try { await HandleUpdate(update); }
+    catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
+    catch (Exception ex) { Console.Error.WriteLine($"Ошибка обработки обновления: {ex.Message}"); }
+}
+
+async Task HandleUpdate(Update update)
+{
     if (update.CallbackQuery is not { Data: "show_transcript" } query) return;
     if (query.Message is not { } clickedMessage)
     {
@@ -128,50 +156,66 @@ async Task OnUpdate(Update update)
     int buttonMessageId = clickedMessage.Id;
     var key = Key(chatId, buttonMessageId);
 
-    // Important: Telegram needs an answer to the callback promptly, BEFORE Whisper starts.
     bool exists;
     lock (pending) exists = pending.ContainsKey(key);
-    await bot.AnswerCallbackQuery(query.Id,
-        exists ? "Начинаю распознавание…" : "Эта кнопка уже обработана или устарела.",
-        showAlert: !exists,
-        cancellationToken: cts.Token);
-    if (!exists) return;
+    if (!exists)
+    {
+        await bot.AnswerCallbackQuery(query.Id, "Эта кнопка уже обработана или устарела.",
+            showAlert: true, cancellationToken: cts.Token);
+        return;
+    }
 
-    await whisperGate.WaitAsync(cts.Token);
+    var status = queue.TryReserve(key, out var reserved);
+    using var reservation = reserved;
+    if (status != QueueStatus.Accepted)
+    {
+        await bot.AnswerCallbackQuery(query.Id,
+            status == QueueStatus.AlreadyQueued
+                ? "Это сообщение уже в очереди или распознаётся."
+                : "Очередь заполнена. Попробуйте немного позже.",
+            cancellationToken: cts.Token);
+        return;
+    }
+
     try
     {
-        VoiceJob? job;
-        lock (pending) pending.TryGetValue(key, out job);
-        if (job is null)
-        {
-            // Already processed, or data was removed.
-            return;
-        }
-
-        await bot.EditMessageText(chatId, buttonMessageId,
-            "⏳ Распознаю голосовое… Это может занять немного времени.",
-            replyMarkup: ShowButton(), // still clickable if the bot restarts mid-transcription
+        await bot.AnswerCallbackQuery(query.Id, "Добавлено в очередь распознавания…",
             cancellationToken: cts.Token);
-
-        string transcript = await TranscribeVoice(job.FileId, cts.Token);
-        if (string.IsNullOrWhiteSpace(transcript))
-            transcript = "Речь не распознана. Попробуйте записать сообщение чётче.";
-
-        var chunks = SplitText("📝 Расшифровка:\n\n" + transcript, 3500).ToArray();
-
-        // Editing our own button message removes the keyboard and reveals the transcription.
-        await bot.EditMessageText(chatId, buttonMessageId, chunks[0], cancellationToken: cts.Token);
-
-        for (int i = 1; i < chunks.Length; i++)
+        await reservation!.RunAsync(async () =>
         {
-            await bot.SendMessage(chatId, chunks[i],
-                replyParameters: job.OriginalMessageId,
-                messageThreadId: job.MessageThreadId,
-                cancellationToken: cts.Token);
-        }
+            VoiceJob? job;
+            lock (pending) pending.TryGetValue(key, out job);
+            if (job is null)
+            {
+                // Already processed, or data was removed.
+                return;
+            }
 
-        RemovePending(key);
-        Console.WriteLine($"OK chat={chatId}, voice={job.OriginalMessageId}, chars={transcript.Length}");
+            await bot.EditMessageText(chatId, buttonMessageId,
+                "⏳ Распознаю голосовое… Это может занять немного времени.",
+                replyMarkup: ShowButton(), // still clickable if the bot restarts mid-transcription
+                cancellationToken: cts.Token);
+
+            string transcript = await TranscribeVoice(job.FileId, cts.Token);
+            if (string.IsNullOrWhiteSpace(transcript))
+                transcript = "Речь не распознана. Попробуйте записать сообщение чётче.";
+
+            var chunks = TextChunks.Split("📝 Расшифровка:\n\n" + transcript, 3500).ToArray();
+
+            // Editing our own button message removes the keyboard and reveals the transcription.
+            await bot.EditMessageText(chatId, buttonMessageId, chunks[0], cancellationToken: cts.Token);
+
+            for (int i = 1; i < chunks.Length; i++)
+            {
+                await bot.SendMessage(chatId, chunks[i],
+                    replyParameters: job.OriginalMessageId,
+                    messageThreadId: job.MessageThreadId,
+                    cancellationToken: cts.Token);
+            }
+
+            RemovePending(key);
+            Console.WriteLine($"OK chat={chatId}, voice={job.OriginalMessageId}, chars={transcript.Length}");
+        }, cts.Token);
     }
     catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
     catch (Exception ex)
@@ -180,7 +224,7 @@ async Task OnUpdate(Update update)
         try
         {
             await bot.EditMessageText(chatId, buttonMessageId,
-                "❌ Не удалось распознать голосовое. Проверьте PowerShell и попробуйте ещё раз.",
+                "❌ Не удалось распознать голосовое. Проверьте журнал бота и попробуйте ещё раз.",
                 replyMarkup: ShowButton(),
                 cancellationToken: cts.Token);
         }
@@ -189,7 +233,6 @@ async Task OnUpdate(Update update)
             Console.Error.WriteLine($"Не удалось вернуть кнопку: {editEx.Message}");
         }
     }
-    finally { whisperGate.Release(); }
 }
 
 static InlineKeyboardMarkup ShowButton() => new(new[]
@@ -203,8 +246,16 @@ void SavePending(VoiceJob job)
 {
     lock (pending)
     {
-        pending[Key(job.ChatId, job.ButtonMessageId)] = job;
-        PersistPending();
+        string key = Key(job.ChatId, job.ButtonMessageId);
+        pending.TryGetValue(key, out var previous);
+        pending[key] = job;
+        try { PersistPending(); }
+        catch
+        {
+            if (previous is null) pending.Remove(key);
+            else pending[key] = previous;
+            throw;
+        }
     }
 }
 
@@ -212,8 +263,9 @@ void RemovePending(string key)
 {
     lock (pending)
     {
-        pending.Remove(key);
-        PersistPending();
+        if (!pending.Remove(key, out var previous)) return;
+        try { PersistPending(); }
+        catch { pending[key] = previous; throw; }
     }
 }
 
@@ -240,15 +292,15 @@ async Task<string> TranscribeVoice(string fileId, CancellationToken ct)
         await using (var fileStream = File.Create(oggPath))
             await bot.DownloadFile(fileInfo, fileStream, cancellationToken: ct);
 
-        await RunProcess(ffmpegExe, [
+        await ProcessRunner.RunAsync(ffmpegExe, [
             "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
             "-i", oggPath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavPath
-        ], ct);
+        ], root, ct);
 
-        await RunProcess(whisperExe, [
+        await ProcessRunner.RunAsync(whisperExe, [
             "-m", whisperModel, "-f", wavPath, "-l", config.Language,
             "-otxt", "-of", resultBase, "-nt"
-        ], ct);
+        ], root, ct);
 
         string resultFile = resultBase + ".txt";
         if (!File.Exists(resultFile))
@@ -263,40 +315,6 @@ async Task<string> TranscribeVoice(string fileId, CancellationToken ct)
     }
 }
 
-async Task RunProcess(string executable, IReadOnlyList<string> args, CancellationToken ct)
-{
-    var info = new ProcessStartInfo
-    {
-        FileName = executable,
-        WorkingDirectory = Path.IsPathRooted(executable) ? Path.GetDirectoryName(executable)! : root,
-        RedirectStandardOutput = true,
-        RedirectStandardError = true,
-        UseShellExecute = false,
-        CreateNoWindow = true
-    };
-    foreach (var arg in args) info.ArgumentList.Add(arg);
-
-    using var proc = new Process { StartInfo = info };
-    if (!proc.Start()) throw new IOException($"Не удалось запустить {executable}");
-
-    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-    timeout.CancelAfter(TimeSpan.FromMinutes(10));
-    Task<string> outTask = proc.StandardOutput.ReadToEndAsync(timeout.Token);
-    Task<string> errTask = proc.StandardError.ReadToEndAsync(timeout.Token);
-
-    try { await proc.WaitForExitAsync(timeout.Token); }
-    catch (OperationCanceledException)
-    {
-        if (!proc.HasExited) proc.Kill(entireProcessTree: true);
-        throw new TimeoutException($"Процесс {Path.GetFileName(executable)} остановлен или превысил лимит 10 минут.");
-    }
-
-    string output = await outTask;
-    string error = await errTask;
-    if (proc.ExitCode != 0)
-        throw new IOException($"{Path.GetFileName(executable)} вернул код {proc.ExitCode}:\n{Trim(error + "\n" + output, 2000)}");
-}
-
 async Task SafeSend(Message original, string text)
 {
     try
@@ -307,22 +325,6 @@ async Task SafeSend(Message original, string text)
             cancellationToken: cts.Token);
     }
     catch (Exception e) { Console.Error.WriteLine($"Не удалось ответить в чат: {e.Message}"); }
-}
-
-string ResolvePath(string value)
-{
-    if (Path.IsPathRooted(value)) return value;
-    if (value.Contains('/') || value.Contains('\\') || value.StartsWith('.'))
-        return Path.GetFullPath(Path.Combine(root, value));
-    return value;
-}
-
-static string Trim(string text, int length) => text.Length <= length ? text : text[..length];
-
-static IEnumerable<string> SplitText(string text, int chunkSize)
-{
-    for (int start = 0; start < text.Length; start += chunkSize)
-        yield return text.Substring(start, Math.Min(chunkSize, text.Length - start));
 }
 
 sealed class VoiceJob
@@ -342,4 +344,5 @@ sealed class BotSettings
     public string FfmpegExe { get; init; } = "ffmpeg";
     public string Language { get; init; } = "auto";
     public int MaxVoiceSeconds { get; init; } = 180;
+    public int MaxQueuedTranscriptions { get; init; } = 20;
 }

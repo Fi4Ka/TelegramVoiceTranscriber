@@ -3,5 +3,6 @@ obj/
 tmp/
 tools/
 settings.local.json
+data/
 .vs/
 *.user

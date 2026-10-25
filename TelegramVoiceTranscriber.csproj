@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Remove="tests/**/*.cs" />
     <PackageReference Include="Telegram.Bot" Version="22.10.3.3" />
   </ItemGroup>
 </Project>
