@@ -4,5 +4,6 @@
   "WhisperModel": "tools/models/ggml-base.bin",
   "FfmpegExe": "ffmpeg",
   "Language": "auto",
-  "MaxVoiceSeconds": 180
+  "MaxVoiceSeconds": 180,
+  "MaxQueuedTranscriptions": 20
 }

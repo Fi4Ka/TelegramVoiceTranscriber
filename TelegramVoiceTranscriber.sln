@@ -5,6 +5,10 @@ VisualStudioVersion = 17.14.37531.7 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TelegramVoiceTranscriber", "TelegramVoiceTranscriber.csproj", "{CF401763-B665-E912-BE51-26A610385596}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{DBCF6D99-34AC-49F7-870C-7CA77F19B136}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TelegramVoiceTranscriber.Tests", "tests\TelegramVoiceTranscriber.Tests\TelegramVoiceTranscriber.Tests.csproj", "{8492CD49-4B16-48B3-A1C2-BCD7EB2B6AF3}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -15,11 +19,18 @@ Global
 		{CF401763-B665-E912-BE51-26A610385596}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{CF401763-B665-E912-BE51-26A610385596}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{CF401763-B665-E912-BE51-26A610385596}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8492CD49-4B16-48B3-A1C2-BCD7EB2B6AF3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8492CD49-4B16-48B3-A1C2-BCD7EB2B6AF3}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8492CD49-4B16-48B3-A1C2-BCD7EB2B6AF3}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8492CD49-4B16-48B3-A1C2-BCD7EB2B6AF3}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {4EB67FA7-0A82-405D-8606-B89EEDE1D3F8}
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{8492CD49-4B16-48B3-A1C2-BCD7EB2B6AF3} = {DBCF6D99-34AC-49F7-870C-7CA77F19B136}
 	EndGlobalSection
 EndGlobal
